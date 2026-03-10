@@ -34,26 +34,150 @@ class BlockExtractor:
                 print("Нет выбранных объектов!")
                 return None
 
-            # Создаем блок через команду
-            base_ap = APoint(base_point)
-            block = doc.Blocks.Add(base_ap, block_name)
+            # Создаем блок через API AutoCAD
+            acad_block = doc.Blocks.Add(APoint(base_point), block_name.upper())
 
-            # Копируем объекты в блок
+            # Копируем объекты в блок через Copy
+            copied = 0
             for i in range(selection.Count):
                 entity = selection.Item(i)
-                # Логика копирования...
+                try:
+                    # Пробуем скопировать
+                    entity.Copy(acad_block)
+                    copied += 1
+                except Exception as e:
+                    # Если не копируется - пробуем вручную
+                    try:
+                        self._copy_entity_manual(entity, acad_block)
+                        copied += 1
+                    except:
+                        pass
 
-            # Анализируем созданный блок
-            block_def = self._analyze_block(block_name)
-            block_def["description"] = description
-            block_def["category"] = category
-            block_def["source"] = "extracted_from_dwg"
+            # Получаем геометрию для библиотеки
+            geometry = self._get_block_geometry(acad_block)
 
-            return block_def
+            return {
+                "block_name": block_name.upper(),
+                "geometry": geometry,
+                "attributes": [],
+                "bounds": self._calculate_bounds(geometry),
+                "entity_count": selection.Count,
+                "copied_count": copied,
+                "category": category,
+                "description": description,
+                "source": "extracted_from_dwg"
+            }
 
         except Exception as e:
             print(f"Ошибка извлечения: {e}")
+            import traceback
+            traceback.print_exc()
             return None
+
+    def _copy_entity_manual(self, entity, block):
+        """Ручное копирование сущности в блок"""
+        entity_type = entity.EntityName
+
+        if entity_type == 'AcDbLine':
+            block.AddLine(entity.StartPoint, entity.EndPoint)
+        elif entity_type == 'AcDbCircle':
+            block.AddCircle(entity.Center, entity.Radius)
+        elif entity_type == 'AcDbArc':
+            block.AddArc(entity.Center, entity.Radius, entity.StartAngle, entity.EndAngle)
+        elif entity_type == 'AcDbText':
+            block.AddText(entity.TextString, entity.InsertionPoint, entity.Height)
+        elif entity_type == 'AcDbMText':
+            block.AddMText(entity.InsertionPoint, entity.Width, entity.TextString)
+        elif entity_type == 'AcDbPolyline':
+            points = []
+            for i in range(entity.NumberOfVertices):
+                point = entity.Coordinate(i)
+                points.extend([point[0], point[1], 0])
+            new_poly = block.AddPolyline(aDouble(*points))
+            new_poly.Closed = entity.Closed
+
+    def _get_block_geometry(self, block):
+        """Получить геометрию блока в виде списка словарей"""
+        geometry = []
+
+        for entity in block:
+            try:
+                entity_type = entity.EntityName
+
+                if entity_type == 'AcDbLine':
+                    geometry.append({
+                        "type": "line",
+                        "start": [entity.StartPoint[0], entity.StartPoint[1]],
+                        "end": [entity.EndPoint[0], entity.EndPoint[1]]
+                    })
+                elif entity_type == 'AcDbCircle':
+                    geometry.append({
+                        "type": "circle",
+                        "center": [entity.Center[0], entity.Center[1]],
+                        "radius": entity.Radius
+                    })
+                elif entity_type == 'AcDbArc':
+                    geometry.append({
+                        "type": "arc",
+                        "center": [entity.Center[0], entity.Center[1]],
+                        "radius": entity.Radius,
+                        "start_angle": entity.StartAngle,
+                        "end_angle": entity.EndAngle
+                    })
+                elif entity_type == 'AcDbText':
+                    geometry.append({
+                        "type": "text",
+                        "position": [entity.InsertionPoint[0], entity.InsertionPoint[1]],
+                        "content": entity.TextString,
+                        "height": entity.Height
+                    })
+                elif entity_type == 'AcDbPolyline':
+                    points = []
+                    for i in range(entity.NumberOfVertices):
+                        point = entity.Coordinate(i)
+                        points.append([point[0], point[1]])
+                    geometry.append({
+                        "type": "polyline",
+                        "points": points,
+                        "closed": entity.Closed
+                    })
+            except Exception as e:
+                pass  # Пропускаем проблемные сущности
+
+        return geometry
+
+    def _calculate_bounds(self, geometry):
+        """Вычислить границы геометрии"""
+        if not geometry:
+            return {"min": [0, 0], "max": [100, 100]}
+
+        all_x = []
+        all_y = []
+
+        for geom in geometry:
+            if geom["type"] == "line":
+                all_x.extend([geom["start"][0], geom["end"][0]])
+                all_y.extend([geom["start"][1], geom["end"][1]])
+            elif geom["type"] == "circle":
+                all_x.extend([geom["center"][0] - geom["radius"], geom["center"][0] + geom["radius"]])
+                all_y.extend([geom["center"][1] - geom["radius"], geom["center"][1] + geom["radius"]])
+            elif geom["type"] == "arc":
+                all_x.extend([geom["center"][0] - geom["radius"], geom["center"][0] + geom["radius"]])
+                all_y.extend([geom["center"][1] - geom["radius"], geom["center"][1] + geom["radius"]])
+            elif geom["type"] == "polyline":
+                for point in geom["points"]:
+                    all_x.append(point[0])
+                    all_y.append(point[1])
+            elif geom["type"] == "text":
+                all_x.append(geom["position"][0])
+                all_y.append(geom["position"][1])
+
+        if all_x and all_y:
+            return {
+                "min": [min(all_x), min(all_y)],
+                "max": [max(all_x), max(all_y)]
+            }
+        return {"min": [0, 0], "max": [100, 100]}
 
     def extract_from_dxf(self,
                          dxf_path: str,
@@ -74,7 +198,7 @@ class BlockExtractor:
                         bbox = entity.bbox()
                         if bbox:
                             if (bbox.extmin[0] >= xmin and bbox.extmax[0] <= xmax and
-                                    bbox.extmin[1] >= ymin and bbox.extmax[1] <= ymax):
+                                bbox.extmin[1] >= ymin and bbox.extmax[1] <= ymax):
                                 entities.append(entity)
                     except:
                         pass
@@ -109,70 +233,6 @@ class BlockExtractor:
         except Exception as e:
             print(f"Ошибка извлечения из DXF: {e}")
             return None
-
-    def _analyze_block(self, block_name: str) -> Dict[str, Any]:
-        """Проанализировать существующий блок в AutoCAD"""
-        block = self.acad.doc.Blocks.Item(block_name)
-
-        geometry = []
-        attributes = []
-
-        for entity in block:
-            entity_type = entity.EntityName
-
-            if entity_type == 'AcDbLine':
-                geometry.append({
-                    "type": "line",
-                    "start": [entity.StartPoint[0], entity.StartPoint[1]],
-                    "end": [entity.EndPoint[0], entity.EndPoint[1]]
-                })
-
-            elif entity_type == 'AcDbCircle':
-                geometry.append({
-                    "type": "circle",
-                    "center": [entity.Center[0], entity.Center[1]],
-                    "radius": entity.Radius
-                })
-
-            elif entity_type == 'AcDbArc':
-                geometry.append({
-                    "type": "arc",
-                    "center": [entity.Center[0], entity.Center[1]],
-                    "radius": entity.Radius,
-                    "start_angle": entity.StartAngle,
-                    "end_angle": entity.EndAngle
-                })
-
-            elif entity_type == 'AcDbText':
-                geometry.append({
-                    "type": "text",
-                    "position": [entity.InsertionPoint[0], entity.InsertionPoint[1]],
-                    "content": entity.TextString,
-                    "height": entity.Height
-                })
-
-            elif entity_type == 'AcDbAttributeDefinition':
-                attributes.append({
-                    "tag": entity.TagString,
-                    "prompt": entity.PromptString,
-                    "default": entity.TextString,
-                    "height": entity.Height,
-                    "position": [entity.InsertionPoint[0], entity.InsertionPoint[1]]
-                })
-
-        extents = block.Extents
-        bounds = {
-            "min": [extents.minPoint[0], extents.minPoint[1]],
-            "max": [extents.maxPoint[0], extents.maxPoint[1]]
-        }
-
-        return {
-            "block_name": block_name,
-            "geometry": geometry,
-            "attributes": attributes,
-            "bounds": bounds,
-            "entity_count": block.Count
-        }
 
     def _entity_to_geometry(self, entity) -> Optional[Dict[str, Any]]:
         """Конвертировать ezdxf сущность в геометрию"""
@@ -225,7 +285,7 @@ class BlockExtractor:
             block.add_circle(entity.dxf.center, entity.dxf.radius)
         elif dxftype == 'ARC':
             block.add_arc(entity.dxf.center, entity.dxf.radius,
-                          entity.dxf.start_angle, entity.dxf.end_angle)
+                         entity.dxf.start_angle, entity.dxf.end_angle)
         elif dxftype == 'LWPOLYLINE':
             points = [tuple(p[:2]) for p in entity.get_points()]
             block.add_lwpolyline(points, close=entity.closed)
